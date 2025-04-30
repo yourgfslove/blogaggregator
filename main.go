@@ -76,15 +76,15 @@ func main() {
 	s.cfg = &cfg
 	s.db = dbquery
 	cmds = commands{make(map[string]func(*state, command) error)}
-	cmds.register("login", loginHandler)
-	cmds.register("register", registerHandler)
-	cmds.register("reset", resetHandler)
+	cmds.register("login", middlewareLoggedIn(loginHandler))
+	cmds.register("register", middlewareLoggedIn(registerHandler))
+	cmds.register("reset", middlewareLoggedIn(resetHandler))
 	cmds.register("getusers", getUsersHandler)
-	cmds.register("agg", aggHandler)
-	cmds.register("addfeed", addFeedHandler)
+	cmds.register("agg", middlewareLoggedIn(aggHandler))
+	cmds.register("addfeed", middlewareLoggedIn(addFeedHandler))
 	cmds.register("feeds", feedsHandler)
-	cmds.register("follow", followHandler)
-	cmds.register("following", followingHandler)
+	cmds.register("follow", middlewareLoggedIn(followHandler))
+	cmds.register("following", middlewareLoggedIn(followingHandler))
 	if len(os.Args) < 2 {
 		fmt.Println("to many commands")
 		os.Exit(1)
@@ -95,15 +95,11 @@ func main() {
 	}
 }
 
-func loginHandler(s *state, cmd command) error {
+func loginHandler(s *state, cmd command, user database.User) error {
 	if len(cmd.args) < 1 {
 		return errors.New("wrong number of arguments")
 	}
-	user, err := s.db.GetUser(context.Background(), cmd.args[0])
-	if err != nil {
-		return errors.New("user not found")
-	}
-	err = s.cfg.SetUser(user.Name)
+	err := s.cfg.SetUser(user.Name)
 	if err != nil {
 		return err
 	}
@@ -111,15 +107,11 @@ func loginHandler(s *state, cmd command) error {
 	return nil
 }
 
-func registerHandler(s *state, cmd command) error {
+func registerHandler(s *state, cmd command, user database.User) error {
 	if len(cmd.args) < 1 {
 		return errors.New("wrong number of arguments")
 	}
-	user, err := s.db.GetUser(context.Background(), cmd.args[0])
-	if err == nil {
-		return errors.New("user already exists")
-	}
-	user, err = s.db.CreateUser(context.Background(), database.CreateUserParams{
+	user, err := s.db.CreateUser(context.Background(), database.CreateUserParams{
 		ID:        uuid.New(),
 		CreatedAt: sql.NullTime{Time: time.Now(), Valid: true},
 		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
@@ -136,7 +128,7 @@ func registerHandler(s *state, cmd command) error {
 	return nil
 }
 
-func resetHandler(s *state, cmd command) error {
+func resetHandler(s *state, cmd command, user database.User) error {
 	err := s.db.Reset(context.Background())
 	if err != nil {
 		return err
@@ -187,7 +179,7 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &rss, nil
 }
 
-func aggHandler(s *state, cmd command) error {
+func aggHandler(s *state, cmd command, user database.User) error {
 	rss, err := fetchFeed(context.Background(), "url")
 	if err != nil {
 		return err
@@ -202,13 +194,9 @@ func aggHandler(s *state, cmd command) error {
 	return nil
 }
 
-func addFeedHandler(s *state, cmd command) error {
+func addFeedHandler(s *state, cmd command, user database.User) error {
 	if len(cmd.args) != 2 {
 		return errors.New("wrong number of arguments")
-	}
-	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
-	if err != nil {
-		return errors.New("user not found")
 	}
 	feed, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
 		ID:        uuid.New(),
@@ -225,7 +213,7 @@ func addFeedHandler(s *state, cmd command) error {
 	fmt.Printf("New feed %s created with URL %s\n", feed.Name, feed.Url)
 	url := cmd.args[1]
 	followcmd := command{name: "follow", args: []string{url}}
-	if err = followHandler(s, followcmd); err != nil {
+	if err = followHandler(s, followcmd, user); err != nil {
 		return err
 	}
 	return nil
@@ -243,11 +231,7 @@ func feedsHandler(s *state, cmd command) error {
 
 }
 
-func followHandler(s *state, cmd command) error {
-	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
-	if err != nil {
-		return err
-	}
+func followHandler(s *state, cmd command, user database.User) error {
 	feed, err := s.db.GetFeedbyurl(context.Background(), cmd.args[0])
 	if err != nil {
 		return err
@@ -266,11 +250,7 @@ func followHandler(s *state, cmd command) error {
 	return nil
 }
 
-func followingHandler(s *state, cmd command) error {
-	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
-	if err != nil {
-		return err
-	}
+func followingHandler(s *state, cmd command, user database.User) error {
 	follows, err := s.db.GetUsersFollowList(context.Background(), user.ID)
 	if err != nil {
 		return err
@@ -279,4 +259,17 @@ func followingHandler(s *state, cmd command) error {
 		fmt.Println(follow.Name)
 	}
 	return nil
+}
+
+func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
+	return func(s *state, cmd command) error {
+		if s.cfg.CurrentUserName == "" {
+			return errors.New("no user logged in")
+		}
+		user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+		if err != nil {
+			return err
+		}
+		return handler(s, cmd, user)
+	}
 }
