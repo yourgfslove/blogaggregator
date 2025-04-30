@@ -3,17 +3,37 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"github.com/yourgfslove/BLOGagregator/internal/config"
 	"github.com/yourgfslove/BLOGagregator/internal/database"
+	"html"
+	"io"
 	"log"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
+type RSSFeed struct {
+	Channel struct {
+		Title       string    `xml:"title"`
+		Link        string    `xml:"link"`
+		Description string    `xml:"description"`
+		Item        []RSSItem `xml:"item"`
+	} `xml:"channel"`
+}
+
+type RSSItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
 type state struct {
 	db  *database.Queries
 	cfg *config.Config
@@ -40,6 +60,9 @@ func (c *commands) run(s *state, cmd command) error {
 	return handler(s, cmd)
 }
 
+var s state
+var cmds commands
+
 func main() {
 	cfg, err := config.Read()
 	if err != nil {
@@ -50,19 +73,23 @@ func main() {
 		log.Fatal(err)
 	}
 	dbquery := database.New(dbconn)
-	var s state
 	s.cfg = &cfg
 	s.db = dbquery
-	cmds := commands{make(map[string]func(*state, command) error)}
+	cmds = commands{make(map[string]func(*state, command) error)}
 	cmds.register("login", loginHandler)
 	cmds.register("register", registerHandler)
 	cmds.register("reset", resetHandler)
-	cmds.register("GetUsers", getUsersHandler)
+	cmds.register("getusers", getUsersHandler)
+	cmds.register("agg", aggHandler)
+	cmds.register("addfeed", addFeedHandler)
+	cmds.register("feeds", feedsHandler)
+	cmds.register("follow", followHandler)
+	cmds.register("following", followingHandler)
 	if len(os.Args) < 2 {
 		fmt.Println("to many commands")
 		os.Exit(1)
 	}
-	cmd := command{os.Args[1], os.Args[2:]}
+	cmd := command{strings.ToLower(os.Args[1]), os.Args[2:]}
 	if err = cmds.run(&s, cmd); err != nil {
 		log.Fatal(err)
 	}
@@ -132,6 +159,124 @@ func getUsersHandler(s *state, cmd command) error {
 		} else {
 			fmt.Println(user.Name)
 		}
+	}
+	return nil
+}
+
+func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "gator")
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var rss RSSFeed
+	err = xml.Unmarshal(data, &rss)
+	if err != nil {
+		return nil, err
+	}
+	return &rss, nil
+}
+
+func aggHandler(s *state, cmd command) error {
+	rss, err := fetchFeed(context.Background(), "url")
+	if err != nil {
+		return err
+	}
+	rss.Channel.Title = html.UnescapeString(rss.Channel.Title)
+	rss.Channel.Description = html.UnescapeString(rss.Channel.Description)
+	for i := range rss.Channel.Item {
+		rss.Channel.Item[i].Title = html.UnescapeString(rss.Channel.Item[i].Title)
+		rss.Channel.Item[i].Description = html.UnescapeString(rss.Channel.Item[i].Description)
+	}
+	fmt.Println(rss)
+	return nil
+}
+
+func addFeedHandler(s *state, cmd command) error {
+	if len(cmd.args) != 2 {
+		return errors.New("wrong number of arguments")
+	}
+	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return errors.New("user not found")
+	}
+	feed, err := s.db.CreateFeed(context.Background(), database.CreateFeedParams{
+		ID:        uuid.New(),
+		Name:      cmd.args[0],
+		Url:       cmd.args[1],
+		CreatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		UserID:    uuid.UUID(user.ID),
+	})
+
+	if err != nil {
+		return errors.New("Cant create feed")
+	}
+	fmt.Printf("New feed %s created with URL %s\n", feed.Name, feed.Url)
+	url := cmd.args[1]
+	followcmd := command{name: "follow", args: []string{url}}
+	if err = followHandler(s, followcmd); err != nil {
+		return err
+	}
+	return nil
+}
+
+func feedsHandler(s *state, cmd command) error {
+	feeds, err := s.db.Feeds(context.Background())
+	if err != nil {
+		return err
+	}
+	for _, feed := range feeds {
+		fmt.Println(feed.Name, feed.Url, feed.Name_2)
+	}
+	return nil
+
+}
+
+func followHandler(s *state, cmd command) error {
+	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return err
+	}
+	feed, err := s.db.GetFeedbyurl(context.Background(), cmd.args[0])
+	if err != nil {
+		return err
+	}
+	_, err = s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		UpdatedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		UserID:    uuid.UUID(user.ID),
+		FeedID:    uuid.UUID(feed.ID),
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s Followed on %s\n", user.Name, feed.Name)
+	return nil
+}
+
+func followingHandler(s *state, cmd command) error {
+	user, err := s.db.GetUser(context.Background(), s.cfg.CurrentUserName)
+	if err != nil {
+		return err
+	}
+	follows, err := s.db.GetUsersFollowList(context.Background(), user.ID)
+	if err != nil {
+		return err
+	}
+	for _, follow := range follows {
+		fmt.Println(follow.Name)
 	}
 	return nil
 }
