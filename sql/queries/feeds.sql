@@ -21,3 +21,12 @@ ON users.id = feeds.user_id;
 SELECT *
 FROM feeds
 WHERE url = $1;
+
+-- name: MarkFeedFetched :exec
+
+INSERT INTO feeds (updated_at, last_fetched_at)
+VALUES (
+        $1,
+        $2
+)
+WHERE id = $3;
