@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,6 +28,8 @@ type RSSFeed struct {
 		Item        []RSSItem `xml:"item"`
 	} `xml:"channel"`
 }
+
+const TimeLayout = "Mon, 02 Jan 2006 15:04:05 -0700"
 
 type RSSItem struct {
 	Title       string `xml:"title"`
@@ -80,14 +83,15 @@ func main() {
 	cmds.register("register", registerHandler)
 	cmds.register("reset", middlewareLoggedIn(resetHandler))
 	cmds.register("getusers", getUsersHandler)
-	cmds.register("agg", middlewareLoggedIn(aggHandler))
+	cmds.register("agg", aggHandler)
 	cmds.register("addfeed", middlewareLoggedIn(addFeedHandler))
 	cmds.register("feeds", feedsHandler)
 	cmds.register("follow", middlewareLoggedIn(followHandler))
 	cmds.register("following", middlewareLoggedIn(followingHandler))
 	cmds.register("unfollow", middlewareLoggedIn(unfollowHandler))
+	cmds.register("getposts", middlewareLoggedIn(GetPostshandler))
 	if len(os.Args) < 2 {
-		fmt.Println("to many commands")
+		fmt.Println("No commands found")
 		os.Exit(1)
 	}
 	cmd := command{strings.ToLower(os.Args[1]), os.Args[2:]}
@@ -97,7 +101,7 @@ func main() {
 }
 
 func loginHandler(s *state, cmd command) error {
-	if len(cmd.args) < 1 {
+	if len(cmd.args) != 1 {
 		return errors.New("usage: <Username>")
 	}
 	user, err := s.db.GetUser(context.Background(), cmd.args[0])
@@ -184,19 +188,23 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &rss, nil
 }
 
-func aggHandler(s *state, cmd command, user database.User) error {
-	rss, err := fetchFeed(context.Background(), "url")
+func aggHandler(s *state, cmd command) error {
+	if len(cmd.args) != 1 {
+		return errors.New("usage: agg <Time(2m or 20s or smth)>")
+	}
+	timebetweenRequests, err := time.ParseDuration(cmd.args[0])
 	if err != nil {
 		return err
 	}
-	rss.Channel.Title = html.UnescapeString(rss.Channel.Title)
-	rss.Channel.Description = html.UnescapeString(rss.Channel.Description)
-	for i := range rss.Channel.Item {
-		rss.Channel.Item[i].Title = html.UnescapeString(rss.Channel.Item[i].Title)
-		rss.Channel.Item[i].Description = html.UnescapeString(rss.Channel.Item[i].Description)
+	fmt.Printf("collectin feed every %v\n", timebetweenRequests)
+	ticker := time.NewTicker(timebetweenRequests)
+	defer ticker.Stop()
+	for ; ; <-ticker.C {
+		err = scrapeFeed()
+		if err != nil {
+			return err
+		}
 	}
-	fmt.Println(rss)
-	return nil
 }
 
 func addFeedHandler(s *state, cmd command, user database.User) error {
@@ -295,5 +303,63 @@ func unfollowHandler(s *state, cmd command, user database.User) error {
 		FeedID: feed.ID,
 	})
 	fmt.Printf("%s Unfollowed on %s\n", user.Name, feed.Name)
+	return nil
+}
+
+func scrapeFeed() error {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return err
+	}
+	rss, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		return err
+	}
+	err = s.db.MarkFeedFetched(context.Background(), database.MarkFeedFetchedParams{
+		UpdatedAt:     sql.NullTime{Time: time.Now(), Valid: true},
+		LastFetchedAt: sql.NullTime{Time: time.Now(), Valid: true},
+		ID:            feed.ID,
+	})
+	if err != nil {
+		return err
+	}
+	for i := range rss.Channel.Item {
+		pubTime, err := time.Parse(TimeLayout, rss.Channel.Item[i].PubDate)
+		if err != nil {
+			return err
+		}
+		err = s.db.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   sql.NullTime{Time: time.Now(), Valid: true},
+			UpdatedAt:   sql.NullTime{Time: time.Now(), Valid: true},
+			PublishedAt: sql.NullTime{Time: pubTime, Valid: true},
+			Title:       html.UnescapeString(rss.Channel.Item[i].Title),
+			Url:         rss.Channel.Item[i].Link,
+			Description: sql.NullString{String: html.UnescapeString(rss.Channel.Item[i].Description), Valid: true},
+			FeedID:      feed.ID,
+		})
+
+	}
+	return nil
+}
+
+func GetPostshandler(s *state, cmd command, user database.User) error {
+	if len(cmd.args) != 1 {
+		return errors.New("usage: GetPosts <Limit>")
+	}
+	Limit, err := strconv.Atoi(cmd.args[0])
+	if err != nil {
+		return err
+	}
+	posts, err := s.db.GetPosts(context.Background(), database.GetPostsParams{
+		UserID: user.ID,
+		Limit:  int32(Limit),
+	})
+	for _, post := range posts {
+		fmt.Println("========================================")
+		fmt.Println("Title:", post.Title, "\nPublished:", post.PublishedAt.Time.UTC().Format(time.DateTime))
+		fmt.Println("Description:", post.Description.String)
+		fmt.Println("URL:", post.Url)
+	}
 	return nil
 }
